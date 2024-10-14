@@ -1,32 +1,18 @@
 package main
 
-import "log"
-
-type ClientLimits struct {
-	uploadLimit   int
-	downloadLimit int
-	viewLimit     int
-}
-
 func main() {
 
-	fileServerOpts := FileServerOpts{
-		StorageRoot:       ":3000_network",
-		ListenAddr:        ":3000",
-		PathTransformFunc: CASPathTransformFunc,
-		// Transport:         tcpTransport,
-		clientLimits: ClientLimits{
-			uploadLimit:   10,
-			downloadLimit: 10,
-			viewLimit:     100,
+	fileServerOpts := FileStorageOpts{
+		StorageRoot: "my_storage",
+		ListenAddr:  ":3000",
+		Limits: Limits{
+			download: 10,
+			upload:   10,
+			view:     10,
 		},
 	}
 
-	s := NewFileServer(fileServerOpts)
+	s := NewFileStorage(&fileServerOpts)
 
-	if err := s.Start(); err != nil {
-		log.Fatal(err)
-	}
-
-	select {}
+	makeGRPCServerAndRun(s)
 }

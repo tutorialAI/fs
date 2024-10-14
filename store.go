@@ -1,82 +1,37 @@
 package main
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
-	"strings"
+	"time"
 )
 
 const DefaultRootFolderName = "storage"
-
-type PathTransformFunc func(string) PathKey
-
-type PathKey struct {
-	FileName string
-	PathName string
-}
-
-func (p PathKey) FirstPathName() string {
-	paths := strings.Split(p.PathName, "/")
-	if len(paths) == 0 {
-		return ""
-	}
-
-	return paths[0]
-}
-
-func (p PathKey) FullPath() string {
-	return fmt.Sprintf("%s/%s", p.PathName, p.FileName)
-}
+const chunkSize = 64 * 1024
 
 type StoreOpts struct {
-	// the folder name of root, containing all the folder/files of the system
-	Root              string
-	PathTransformFunc PathTransformFunc
+	Root         string
+	UploadFolder string
 }
 
-// content addresable storage
-// 52439/f5e49/ba33b/4b9b2/373dc/d6bfc/9e97c/afb7f
-var CASPathTransformFunc = func(key string) PathKey {
-	hash := sha1.Sum([]byte(key)) // [20]byte
-	hashString := hex.EncodeToString(hash[:])
-	blockSize := 5
-	sliceLenght := len(hashString) / blockSize
-
-	paths := make([]string, sliceLenght)
-
-	for i := 0; i < sliceLenght; i++ {
-		from, to := i*blockSize, i*blockSize+blockSize
-		paths[i] = hashString[from:to]
-	}
-
-	return PathKey{
-		PathName: strings.Join(paths, "/"),
-		FileName: hashString,
-	}
+type FileChunk struct {
+	Data     []byte
+	Chunk    int64
+	ClientID int64
+	FileName string
 }
 
-var DefaultPathTransformFunc = func(key string) PathKey {
-	return PathKey{
-		PathName: key,
-		FileName: key,
-	}
-}
+var FileCreation = make(map[string]time.Time)
 
 type Store struct {
 	StoreOpts
 }
 
 func NewStore(opts StoreOpts) *Store {
-	if opts.PathTransformFunc == nil {
-		opts.PathTransformFunc = DefaultPathTransformFunc
-	}
-
 	if len(opts.Root) == 0 {
 		opts.Root = DefaultRootFolderName
 	}
@@ -86,15 +41,8 @@ func NewStore(opts StoreOpts) *Store {
 	}
 }
 
-func (s *Store) Write(key string, r io.Reader) error {
-	return s.writeStream(key, r)
-}
-
-func (s *Store) Has(key string) bool {
-	pathKey := s.PathTransformFunc(key)
-	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
-
-	_, err := os.Stat(fullPathWithRoot)
+func (s *Store) Has(path string) bool {
+	_, err := os.Stat(path)
 
 	return !errors.Is(err, os.ErrNotExist)
 }
@@ -103,57 +51,116 @@ func (s *Store) Clear() error {
 	return os.RemoveAll(s.Root)
 }
 
-func (s *Store) Delete(key string) error {
-	pathKey := s.PathTransformFunc(key)
+func (s *Store) Delete(clientID int64, fileName string) error {
+	path := fmt.Sprintf("%s/%d/%s", s.Root, clientID, fileName)
 	defer func() {
-		log.Printf("deleted [%s] from disk", pathKey.FileName)
+		log.Printf("deleted [%s] from disk", fileName)
 	}()
 
-	removePathName := fmt.Sprintf("%s/%s", s.Root, pathKey.FirstPathName())
-
-	return os.RemoveAll(removePathName)
+	return os.RemoveAll(path)
 }
 
-func (s *Store) Read(key string) (io.Reader, error) {
-	f, err := s.readStream(key)
+func (s *Store) FileList(clientID int64) ([]fs.FileInfo, error) {
+	path := fmt.Sprintf("%s/%d/", s.Root, clientID)
+
+	files, err := os.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
 
-	defer f.Close()
+	output := make([]fs.FileInfo, len(files))
 
-	buf := &bytes.Buffer{}
-	_, err = io.Copy(buf, f)
+	for i, file := range files {
+		if file.IsDir() {
+			continue
+		}
 
-	return buf, err
+		info, _ := file.Info()
+		output[i] = info
+	}
+
+	return output, nil
 }
 
-func (s *Store) readStream(key string) (io.ReadCloser, error) {
-	pathKey := s.PathTransformFunc(key)
-	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
+func (s *Store) Download(clientID int64, fileName string) (chan FileChunk, error) {
+	var err error
+	path := fmt.Sprintf("%s/%d/%s", s.Root, clientID, fileName)
 
-	return os.Open(fullPathWithRoot)
+	if !s.Has(path) {
+		return nil, fmt.Errorf("file %s not found", fileName)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.readStream(file)
 }
 
-func (s *Store) writeStream(key string, r io.Reader) error {
-	pathKey := s.PathTransformFunc(key)
-	pathNameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.PathName)
-	if err := os.MkdirAll(pathNameWithRoot, os.ModePerm); err != nil {
+func (s *Store) readStream(file *os.File) (chan FileChunk, error) {
+	chunks := make(chan FileChunk)
+
+	go func() {
+		defer file.Close()
+		defer close(chunks)
+
+		var chunkNumber int64 = 0
+		buffer := make([]byte, chunkSize)
+		for {
+			n, err := file.Read(buffer)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				fmt.Println("Error reading file:", err)
+				return
+			}
+
+			chunks <- FileChunk{
+				Data:  buffer[:n],
+				Chunk: chunkNumber,
+			}
+			chunkNumber++
+		}
+	}()
+
+	return chunks, nil
+}
+
+func (s *Store) writeStream(data <-chan FileChunk) error {
+	isFirstChunk := true
+	var firstChunk FileChunk
+	if isFirstChunk {
+		firstChunk = <-data
+		isFirstChunk = false
+	}
+
+	path := fmt.Sprintf("%s/%d/", s.Root, firstChunk.ClientID)
+	if err := os.MkdirAll(path, os.ModePerm); err != nil {
 		return err
 	}
 
-	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
-	f, err := os.Create(fullPathWithRoot)
+	path = fmt.Sprintf("%s/%s", path, firstChunk.FileName)
+	file, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 
-	n, err := io.Copy(f, r)
-	if err != nil {
-		return err
+	defer file.Close()
+
+	file.Write(firstChunk.Data)
+	for chunk := range data {
+		_, err := file.Write(chunk.Data)
+		if err != nil {
+			return fmt.Errorf("failed to write chunk to file: %s", err)
+		}
 	}
 
-	log.Printf("written (%d) bytes to disk: %s", n, fullPathWithRoot)
+	if !s.Has(path) {
+		FileCreation[firstChunk.FileName] = time.Now()
+	}
+	log.Printf("file %s on disk", firstChunk.FileName)
 
 	return nil
 }
